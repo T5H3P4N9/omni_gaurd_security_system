@@ -1,0 +1,283 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ESP32Servo.h>
+
+// ================= WIFI =================
+const char* ssid = "ZTE_A099DB";
+const char* password = "6621522119";
+
+const char* serverIP = "192.168.0.159";
+
+// ================= PINS =================
+#define TRIG1 5
+#define ECHO1 18
+
+#define TRIG2 2
+#define ECHO2 20
+
+#define LED_PIN 4
+#define BUZZER 19
+#define TARGET_LED_PIN 22
+
+#define SCANNER_SERVO_PIN 13
+#define LASER_SERVO_PIN 15
+
+Servo scannerServo;
+Servo laserServo;
+
+// ================= SETTINGS =================
+#define DETECT_RANGE 40
+#define LOCK_RANGE 30
+#define ALARM_RANGE 20
+
+#define MISS_LIMIT 2
+#define SCAN_SPEED 5
+
+#define SERVO_OFFSET 3
+
+// ================= STATE =================
+int scanAngle = 90;
+int direction = 1;
+
+int laserAngle = 90;
+int lastLockAngle = 90;
+
+int missCount = 0;
+
+unsigned long lastSweepTime = 0;
+unsigned long lastBeepTime = 0;
+unsigned long lastSendTime = 0;
+
+// ================= DISTANCE =================
+int readSensor(int trig, int echo) {
+
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+
+  long t = pulseIn(echo, HIGH, 20000);
+
+  if (t == 0) return 0;
+
+  return t * 0.034 / 2;
+}
+
+// ================= DUAL SENSOR =================
+int getDistance() {
+
+  int d1 = readSensor(TRIG1, ECHO1);
+
+  delayMicroseconds(300);
+
+  int d2 = readSensor(TRIG2, ECHO2);
+
+  if (d1 > 0 && d2 > 0)
+    return min(d1, d2);
+
+  if (d1 > 0)
+    return d1;
+
+  if (d2 > 0)
+    return d2;
+
+  return 0;
+}
+
+// ================= BUZZER =================
+void beepOnce(int freq) {
+
+  ledcAttach(BUZZER, freq, 8);
+  ledcWrite(BUZZER, 128);
+
+  delay(40);
+
+  ledcWrite(BUZZER, 0);
+}
+
+// ================= SEND TO AZI =================
+void sendSensor(int dist, String state, int angle) {
+
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+
+  WiFiClient client;
+  HTTPClient http;
+
+  String url =
+    "http://" + String(serverIP) +
+    ":8000/sensor?dist=" +
+    String(dist) +
+    "&state=" +
+    state +
+    "&angle=" +
+    String(angle);
+
+  http.begin(client, url);
+
+  int code = http.GET();
+
+  Serial.print("HTTP CODE: ");
+  Serial.println(code);
+
+  http.end();
+}
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(TRIG1, OUTPUT);
+  pinMode(ECHO1, INPUT);
+
+  pinMode(TRIG2, OUTPUT);
+  pinMode(ECHO2, INPUT);
+
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(TARGET_LED_PIN, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+
+  scannerServo.attach(SCANNER_SERVO_PIN);
+  laserServo.attach(LASER_SERVO_PIN);
+
+  scannerServo.write(90);
+  laserServo.write(90);
+
+  Serial.println("AZI RADAR STARTING");
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WIFI CONNECTED");
+  Serial.println(WiFi.localIP());
+}
+
+// ================= LOOP =================
+void loop() {
+
+  int dist = getDistance();
+
+  unsigned long now = millis();
+
+  bool detected =
+    (dist > 0 && dist < DETECT_RANGE);
+
+  if (detected) {
+
+    missCount = 0;
+
+    lastLockAngle = scanAngle;
+
+  } else {
+
+    missCount++;
+  }
+
+  bool locked =
+    (missCount < MISS_LIMIT);
+
+  // ================= SCAN =================
+  if (!locked) {
+
+    digitalWrite(LED_PIN, LOW);
+    digitalWrite(TARGET_LED_PIN, LOW);
+
+    if (now - lastSweepTime > 10) {
+
+      lastSweepTime = now;
+
+      scanAngle += direction * SCAN_SPEED;
+
+      if (scanAngle >= 180)
+        direction = -1;
+
+      if (scanAngle <= 0)
+        direction = 1;
+
+      scannerServo.write(scanAngle);
+    }
+
+    laserAngle += (90 - laserAngle) / 6;
+
+    laserServo.write(laserAngle);
+
+  } else {
+
+    // ================= LOCK =================
+    digitalWrite(LED_PIN, HIGH);
+
+    int targetAngle =
+      lastLockAngle + SERVO_OFFSET;
+
+    laserAngle +=
+      (targetAngle - laserAngle) / 3;
+
+    laserServo.write(
+      constrain(laserAngle, 0, 180)
+    );
+
+    // ================= ALERT =================
+    if (dist > 0 && dist < ALARM_RANGE) {
+
+      digitalWrite(
+        TARGET_LED_PIN,
+        now % 120 < 60
+      );
+
+      if (now - lastBeepTime > 150) {
+
+        lastBeepTime = now;
+
+        beepOnce(2500);
+      }
+
+    } else if (dist < LOCK_RANGE) {
+
+      digitalWrite(
+        TARGET_LED_PIN,
+        HIGH
+      );
+
+    } else {
+
+      digitalWrite(
+        TARGET_LED_PIN,
+        LOW
+      );
+    }
+  }
+
+  // ================= AZI UPDATE =================
+  if (now - lastSendTime > 250) {
+
+    lastSendTime = now;
+
+    String state = "CLEAR";
+
+    if (dist > 0 && dist < 20)
+      state = "FINAL_WARNING";
+
+    else if (dist > 0 && dist < 40)
+      state = "WARNING";
+
+    else if (dist > 0 && dist < 60)
+      state = "INTRUDER";
+
+    sendSensor(
+      dist,
+      state,
+      scanAngle
+    );
+  }
+
+  delay(5);
+}

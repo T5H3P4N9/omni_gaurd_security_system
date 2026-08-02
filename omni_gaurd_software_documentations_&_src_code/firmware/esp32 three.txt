@@ -1,0 +1,213 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ESP32Servo.h>
+#include <algorithm>
+
+// ================= CONFIGURATION =================
+const char* ssid = "NetNineNine_NPXg1_2.4Ghz";
+const char* password = "Y_t2x8yYwX";
+const char* serverIP = "192.168.1.71";
+
+// ================= PINS =================
+#define TRIG1 5
+#define ECHO1 18
+#define TRIG2 2
+#define ECHO2 20
+
+#define LED_PIN 4
+#define BUZZER 19
+#define TARGET_LED_PIN 22
+
+#define SCANNER_SERVO_PIN 13
+#define LASER_SERVO_PIN 15
+
+Servo scannerServo;
+Servo laserServo;
+
+// ================= SETTINGS =================
+#define THRESH_FINAL    20
+#define THRESH_WARNING  40
+#define THRESH_INTRUDER 60
+#define HYST_BUFFER     5    // Buffer to exit a state
+
+#define MISS_LIMIT      5    
+#define SCAN_INTERVAL   8   // Faster but smooth (ms per step)
+#define HEARTBEAT_INT   5000 
+#define WIFI_RETRY_INT  10000
+
+#define SERVO_OFFSET    3
+
+// ================= STATE =================
+int scanAngle = 90;
+int direction = 1;
+float laserAngle = 90.0; // Float for smooth proportional math
+int lastLockAngle = 90;
+int missCount = 0;
+
+String currentState = "CLEAR";
+String lastSentState = "";
+int lastSentDist = 0;
+
+unsigned long lastSweepTime = 0;
+unsigned long lastBeepTime = 0;
+unsigned long lastSendTime = 0;
+unsigned long lastWifiRetry = 0;
+
+// ================= FILTERED DISTANCE =================
+int readSensor(int trig, int echo) {
+  const int samples = 5;
+  int values[samples];
+
+  for (int i = 0; i < samples; i++) {
+    digitalWrite(trig, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trig, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trig, LOW);
+
+    // Timeout reduced to 5000us (~85cm) for better loop performance
+    long t = pulseIn(echo, HIGH, 5000); 
+    values[i] = (t == 0) ? 400 : t * 0.034 / 2;
+    delayMicroseconds(500); 
+  }
+
+  std::sort(values, values + samples);
+  return values[2]; // Median
+}
+
+int getDistance() {
+  int d1 = readSensor(TRIG1, ECHO1);
+  int d2 = readSensor(TRIG2, ECHO2);
+  
+  if (d1 > 2 && d2 > 2) return min(d1, d2);
+  if (d1 > 2) return d1;
+  if (d2 > 2) return d2;
+  return 400;
+}
+
+// ================= BUZZER =================
+void beepOnce(int freq) {
+  ledcAttach(BUZZER, freq, 8);
+  ledcWrite(BUZZER, 128);
+  delay(40);
+  ledcWrite(BUZZER, 0);
+}
+
+// ================= OMNI_GUARD BRIDGE =================
+void sendSensorUpdate(int dist, String state, int angle) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClient client;
+  HTTPClient http;
+  String url = "http://" + String(serverIP) + ":8000/sensor?dist=" + String(dist) +
+               "&state=" + state + "&angle=" + String(angle);
+
+  http.begin(client, url);
+  if (http.GET() > 0) {
+    lastSentState = state;
+    lastSentDist = dist;
+    lastSendTime = millis();
+  }
+  http.end();
+}
+
+void handleWifi() {
+  if (WiFi.status() != WL_CONNECTED && (millis() - lastWifiRetry > WIFI_RETRY_INT)) {
+    Serial.println("Reconnecting Wi-Fi...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    lastWifiRetry = millis();
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG1, OUTPUT); pinMode(ECHO1, INPUT);
+  pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
+  pinMode(LED_PIN, OUTPUT); pinMode(TARGET_LED_PIN, OUTPUT); pinMode(BUZZER, OUTPUT);
+
+  scannerServo.attach(SCANNER_SERVO_PIN);
+  laserServo.attach(LASER_SERVO_PIN);
+  scannerServo.write(90);
+  laserServo.write(90);
+
+  WiFi.begin(ssid, password);
+  Serial.println("OMNI_GUARD RADAR INITIALIZING");
+}
+
+// ================= LOOP =================
+void loop() {
+  handleWifi();
+  int currentDist = getDistance();
+  unsigned long now = millis();
+
+  // Target Lock Logic
+  bool detected = (currentDist > 2 && currentDist < THRESH_INTRUDER);
+  if (detected) {
+    missCount = 0;
+    lastLockAngle = scanAngle;
+  } else if (missCount < MISS_LIMIT) {
+    missCount++;
+  }
+  bool isLocked = (missCount < MISS_LIMIT);
+
+  // ================= MODE: SCAN / LOCK =================
+  if (!isLocked) {
+    digitalWrite(LED_PIN, LOW);
+    digitalWrite(TARGET_LED_PIN, LOW);
+
+    if (now - lastSweepTime > SCAN_INTERVAL) {
+      lastSweepTime = now;
+      scanAngle += direction;
+      if (scanAngle >= 180 || scanAngle <= 0) direction *= -1;
+      scannerServo.write(scanAngle);
+    }
+    
+    // Proportional return to center
+    laserAngle += (90.0 - laserAngle) * 0.3;
+    laserServo.write((int)laserAngle);
+
+  } else {
+    digitalWrite(LED_PIN, HIGH);
+
+    // Proportional Target Tracking (Moves 30% of error per frame)
+    float targetPos = (float)lastLockAngle + SERVO_OFFSET;
+    laserAngle += (targetPos - laserAngle) * 0.7;
+    laserServo.write(constrain((int)laserAngle, 0, 180));
+
+    // Audio/Visual feedback
+    if (currentDist < THRESH_FINAL) {
+      digitalWrite(TARGET_LED_PIN, now % 80 < 40); // Faster strobe
+      if (now - lastBeepTime > 80) { lastBeepTime = now; beepOnce(3000); }
+    } else {
+      digitalWrite(TARGET_LED_PIN, HIGH);
+    }
+  }
+
+  // ================= TRUE HYSTERESIS MACHINE =================
+  if (currentState == "FINAL_WARNING") {
+    if (currentDist > THRESH_FINAL + HYST_BUFFER) currentState = "WARNING";
+  } else if (currentState == "WARNING") {
+    if (currentDist < THRESH_FINAL) currentState = "FINAL_WARNING";
+    else if (currentDist > THRESH_WARNING + HYST_BUFFER) currentState = "INTRUDER";
+  } else if (currentState == "INTRUDER") {
+    if (currentDist < THRESH_WARNING) currentState = "WARNING";
+    else if (currentDist > THRESH_INTRUDER + HYST_BUFFER) currentState = "CLEAR";
+  } else { // State is CLEAR
+    if (currentDist < THRESH_FINAL) currentState = "FINAL_WARNING";
+    else if (currentDist < THRESH_WARNING) currentState = "WARNING";
+    else if (currentDist < THRESH_INTRUDER) currentState = "INTRUDER";
+  }
+
+  // ================= SMART UPDATES =================
+  bool stateChanged = (currentState != lastSentState);
+  bool significantDist = (abs(currentDist - lastSentDist) > 4);
+  bool heartbeat = (now - lastSendTime > HEARTBEAT_INT);
+
+  if (stateChanged || (detected && significantDist) || heartbeat) {
+    sendSensorUpdate(currentDist, currentState, scanAngle);
+  }
+
+  delay(1); 
+}

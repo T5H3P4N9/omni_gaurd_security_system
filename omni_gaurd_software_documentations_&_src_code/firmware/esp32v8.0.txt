@@ -1,0 +1,319 @@
+// ==============================================================================
+// OMNI_GUARD SENSOR UNIT V8.0 - PRODUCTION FIRMWARE
+// Feature Set: Multi-Target Tracking, JSON Communication, Non-Blocking Driver
+// Hardware: ESP32-WROOM / ESP32-CAM Compatible
+// ==============================================================================
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ESP32Servo.h>
+#include <ArduinoJson.h>
+#include <vector>
+#include <algorithm>
+
+// ================= CONFIGURATION =================
+const char* ssid     = "NetNineNine_NPXg1_2.4Ghz";
+const char* password = "Y_t2x8yYwX";
+const char* serverIP = "192.168.1.71";
+#define SERVER_PORT  8000
+
+#define VERSION      "8.0"
+#define BUILD        "2026.08.02"
+#define DEVICE_NAME  "SENSOR_UNIT_ALPHA"
+
+// ================= PINS =================
+#define TRIG1 5
+#define ECHO1 18
+#define TRIG2 2
+#define ECHO2 20  // Note: Pin 20 is only on some ESP32 variants, check board
+
+#define LED_STATUS_PIN  4
+#define BUZZER_PIN      19
+#define LED_TARGET_PIN  22
+
+#define SCANNER_SERVO_PIN 13
+#define LASER_SERVO_PIN   15
+
+// ================= SETTINGS =================
+#define THRESH_FINAL    20
+#define THRESH_WARNING  40
+#define THRESH_INTRUDER 60
+#define MAX_RANGE       100
+#define SCAN_STEP       1
+#define SCAN_INTERVAL   12    // ms per step
+#define COMMS_INTERVAL  100   // ms between sensor updates
+#define HEARTBEAT_INT   5000
+#define TARGET_TIMEOUT  3000  // ms to keep target in memory
+
+// ================= DATA STRUCTURES =================
+enum TrackingState { IDLE, SEARCHING, TRACKING, LOCKED, LOST };
+enum ThreatLevel   { CLEAR, READY, WARNING, INTRUDER, FINAL };
+
+struct Target {
+    int id;
+    int distance;
+    int angle;
+    unsigned long lastSeen;
+    float confidence;
+    ThreatLevel threat;
+    bool active;
+};
+
+// ================= GLOBAL OBJECTS =================
+Servo scannerServo;
+Servo laserServo;
+TrackingState globalTrackingState = SEARCHING;
+ThreatLevel currentThreat = CLEAR;
+
+std::vector<Target> targetList;
+int nextTargetId = 100;
+
+// System Variables
+unsigned long ms = 0;
+unsigned long lastScanTime = 0;
+unsigned long lastCommsTime = 0;
+unsigned long lastHeartbeatTime = 0;
+unsigned long lastWifiRetry = 0;
+
+int scanAngle = 90;
+int scanDir = 1;
+float turretPos = 90.0;
+int sensor1Dist = 400;
+int sensor2Dist = 400;
+
+// Diagnostics
+uint32_t packetsSent = 0;
+uint32_t packetFailures = 0;
+uint32_t wifiReconnects = 0;
+
+// ================= SENSOR MODULE =================
+
+int pingSensor(int trig, int echo) {
+    digitalWrite(trig, LOW);
+    delayMicroseconds(2);
+    digitalWrite(trig, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(trig, LOW);
+    long duration = pulseIn(echo, HIGH, 15000); // ~2.5m range timeout
+    if (duration == 0) return 400;
+    return duration * 0.034 / 2;
+}
+
+void updateSensors() {
+    // Median filter with 3 samples
+    int s1[3], s2[3];
+    for(int i=0; i<3; i++) {
+        s1[i] = pingSensor(TRIG1, ECHO1);
+        s2[i] = pingSensor(TRIG2, ECHO2);
+        delayMicroseconds(500);
+    }
+    std::sort(s1, s1+3);
+    std::sort(s2, s2+3);
+
+    sensor1Dist = s1[1];
+    sensor2Dist = s2[1];
+}
+
+// ================= TRACKING MODULE =================
+
+void manageTargets(int dist, int angle) {
+    bool foundExisting = false;
+
+    // Check if hit matches an existing target (fuzzy logic)
+    for (auto &t : targetList) {
+        if (abs(t.angle - angle) < 15 && abs(t.distance - dist) < 20) {
+            t.distance = dist;
+            t.angle = angle;
+            t.lastSeen = ms;
+            t.active = true;
+            foundExisting = true;
+            break;
+        }
+    }
+
+    if (!foundExisting && dist < MAX_RANGE) {
+        Target newTarget;
+        newTarget.id = nextTargetId++;
+        newTarget.distance = dist;
+        newTarget.angle = angle;
+        newTarget.lastSeen = ms;
+        newTarget.active = true;
+        newTarget.confidence = 0.5;
+        targetList.push_back(newTarget);
+    }
+
+    // Cleanup stale targets
+    targetList.erase(std::remove_if(targetList.begin(), targetList.end(),
+        [](const Target& t) { return (millis() - t.lastSeen > TARGET_TIMEOUT); }),
+        targetList.end());
+}
+
+void updateThreatLevel(int dist) {
+    if (dist < THRESH_FINAL) currentThreat = FINAL;
+    else if (dist < THRESH_WARNING) currentThreat = WARNING;
+    else if (dist < THRESH_INTRUDER) currentThreat = INTRUDER;
+    else currentThreat = READY;
+}
+
+// ================= RADAR & SERVO MODULE =================
+
+void handleRadar() {
+    if (ms - lastScanTime >= SCAN_INTERVAL) {
+        lastScanTime = ms;
+
+        if (globalTrackingState == SEARCHING || globalTrackingState == IDLE) {
+            scanAngle += scanDir;
+            if (scanAngle >= 180 || scanAngle <= 0) scanDir *= -1;
+            scannerServo.write(scanAngle);
+        }
+
+        updateSensors();
+        int bestDist = std::min(sensor1Dist, sensor2Dist);
+
+        if (bestDist < MAX_RANGE) {
+            manageTargets(bestDist, scanAngle);
+            updateThreatLevel(bestDist);
+            globalTrackingState = TRACKING;
+        } else {
+            if (targetList.empty()) {
+                globalTrackingState = SEARCHING;
+                currentThreat = CLEAR;
+            } else {
+                globalTrackingState = LOST;
+            }
+        }
+    }
+}
+
+void handleTurret() {
+    float targetAngle = 90.0;
+
+    if (!targetList.empty()) {
+        // Track the closest active target
+        auto closest = std::min_element(targetList.begin(), targetList.end(),
+            [](const Target& a, const Target& b) { return a.distance < b.distance; });
+
+        targetAngle = closest->angle;
+        globalTrackingState = LOCKED;
+        digitalWrite(LED_TARGET_PIN, HIGH);
+    } else {
+        digitalWrite(LED_TARGET_PIN, LOW);
+    }
+
+    // Proportional Smoothing (Non-blocking)
+    float diff = targetAngle - turretPos;
+    turretPos += diff * 0.15; // 15% step per frame
+    laserServo.write((int)turretPos);
+}
+
+// ================= COMMUNICATION MODULE =================
+
+void sendStructuredPacket(const char* type) {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    StaticJsonDocument<1536> doc;
+    doc["type"] = type;
+    doc["version"] = VERSION;
+    doc["device"] = DEVICE_NAME;
+    doc["uptime"] = ms / 1000;
+
+    JsonObject telemetry = doc.createNestedObject("telemetry");
+    telemetry["heap"] = ESP.getFreeHeap();
+    telemetry["rssi"] = WiFi.RSSI();
+    telemetry["threat"] = (int)currentThreat;
+    telemetry["state"] = (int)globalTrackingState;
+    telemetry["packets"] = packetsSent;
+    telemetry["errors"] = packetFailures;
+
+    JsonObject sensor = doc.createNestedObject("sensor");
+    sensor["s1"] = sensor1Dist;
+    sensor["s2"] = sensor2Dist;
+    sensor["angle"] = scanAngle;
+    sensor["turret"] = (int)turretPos;
+
+    JsonArray targets = doc.createNestedArray("targets");
+    for (const auto &t : targetList) {
+        JsonObject obj = targets.add<JsonObject>();
+        obj["id"] = t.id;
+        obj["d"] = t.distance;
+        obj["a"] = t.angle;
+    }
+
+    String output;
+    serializeJson(doc, output);
+
+    WiFiClient client;
+    HTTPClient http;
+    String url = "http://" + String(serverIP) + ":" + String(SERVER_PORT) + "/sensor_v8";
+
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+
+    int httpCode = http.POST(output);
+    if (httpCode > 0) {
+        packetsSent++;
+        lastCommsTime = ms;
+    } else {
+        packetFailures++;
+    }
+    http.end();
+}
+
+void handleWifi() {
+    if (WiFi.status() != WL_CONNECTED) {
+        digitalWrite(LED_STATUS_PIN, ms % 500 < 250); // Flash while disconnected
+        if (ms - lastWifiRetry > 10000) {
+            WiFi.begin(ssid, password);
+            lastWifiRetry = ms;
+            wifiReconnects++;
+        }
+    } else {
+        digitalWrite(LED_STATUS_PIN, HIGH);
+    }
+}
+
+// ================= CORE SYSTEM =================
+
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(TRIG1, OUTPUT); pinMode(ECHO1, INPUT);
+    pinMode(TRIG2, OUTPUT); pinMode(ECHO2, INPUT);
+    pinMode(LED_STATUS_PIN, OUTPUT); pinMode(LED_TARGET_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+
+    scannerServo.attach(SCANNER_SERVO_PIN);
+    laserServo.attach(LASER_SERVO_PIN);
+
+    WiFi.begin(ssid, password);
+    Serial.println("OMNI_GUARD ESP32 V8.0 INITIALIZED");
+}
+
+void loop() {
+    ms = millis();
+
+    handleWifi();
+    handleRadar();
+    handleTurret();
+
+    // Non-blocking JSON Communications
+    if (ms - lastCommsTime >= COMMS_INTERVAL) {
+        sendStructuredPacket("SENSOR_UPDATE");
+    }
+
+    if (ms - lastHeartbeatTime >= HEARTBEAT_INT) {
+        sendStructuredPacket("HEARTBEAT");
+        lastHeartbeatTime = ms;
+    }
+
+    // Adaptive Buzzer
+    if (currentThreat == FINAL) {
+        digitalWrite(BUZZER_PIN, ms % 100 < 50);
+    } else if (currentThreat == INTRUDER) {
+        digitalWrite(BUZZER_PIN, ms % 400 < 50);
+    } else {
+        digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    delay(1); // Task yielding
+}

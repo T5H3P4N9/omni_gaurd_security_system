@@ -1,0 +1,85 @@
+// AZI_House_Unit_v2.ino
+// Starter version
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+
+LiquidCrystal_I2C lcd(0x27,16,2);
+SoftwareSerial BT(10,11);
+
+const int RED_LED=6,GREEN_LED=7,BUZZER=8;
+const int BTN_POWER=2,BTN_ARM=3,BTN_DISARM=4,BTN_SILENCE=5;
+
+bool powerOn=false,armed=false,muted=false;
+String state="OFF";
+int dist=0;
+unsigned long tLed=0,tBuzz=0;
+bool flash=false;
+
+void screen(String l1,String l2){
+ lcd.clear(); lcd.setCursor(0,0); lcd.print(l1);
+ lcd.setCursor(0,1); lcd.print(l2);
+}
+
+void setup(){
+ pinMode(RED_LED,OUTPUT); pinMode(GREEN_LED,OUTPUT); pinMode(BUZZER,OUTPUT);
+ pinMode(BTN_POWER,INPUT_PULLUP);
+ pinMode(BTN_ARM,INPUT_PULLUP);
+ pinMode(BTN_DISARM,INPUT_PULLUP);
+ pinMode(BTN_SILENCE,INPUT_PULLUP);
+
+ Serial.begin(9600);
+ BT.begin(9600);
+ lcd.init(); lcd.backlight();
+
+ screen("AZI SECURITY","BOOTING...");
+ delay(1500);
+ screen("AZI SECURITY","CONNECTING...");
+ BT.println("AZI_READY");
+ 
+}
+
+void parse(String s){
+ s.trim();
+ if(s=="HELLO"){ BT.println("AZI_OK"); screen("AZI SECURITY","CONNECTED"); delay(1000); screen("AZI SECURITY","READY"); powerOn=true; state="READY"; return;}
+ if(s.startsWith("STATE:")){
+   String p=s.substring(6);
+   int c=p.indexOf(',');
+   if(c>0){ state=p.substring(0,c); dist=p.substring(c+1).toInt();}
+   else state=p;
+ }
+}
+
+void loop(){
+ if(BT.available()) parse(BT.readStringUntil('\n'));
+
+ if(digitalRead(BTN_POWER)==LOW){delay(25); while(!digitalRead(BTN_POWER)); powerOn=!powerOn; BT.println("BTN:POWER");}
+ if(powerOn){
+   if(digitalRead(BTN_ARM)==LOW){delay(25); while(!digitalRead(BTN_ARM)); armed=true; BT.println("BTN:ARM");}
+   if(digitalRead(BTN_DISARM)==LOW){delay(25); while(!digitalRead(BTN_DISARM)); armed=false; state="SAFE"; BT.println("BTN:DISARM");}
+   if(digitalRead(BTN_SILENCE)==LOW){delay(25); while(!digitalRead(BTN_SILENCE)); muted=true; noTone(BUZZER); BT.println("BTN:SILENCE");}
+ }
+
+ digitalWrite(GREEN_LED,powerOn && armed);
+
+ if(state=="WARNING"){
+   digitalWrite(RED_LED,HIGH);
+   if(!muted && millis()-tBuzz>600){tBuzz=millis(); tone(BUZZER,1500,120);}
+   screen("AZI SECURITY","WARN "+String(dist)+"cm");
+ } else if(state=="INTRUDER"){
+   if(millis()-tLed>250){tLed=millis(); flash=!flash; digitalWrite(RED_LED,flash);}
+   if(!muted && millis()-tBuzz>300){tBuzz=millis(); tone(BUZZER,2000,120);}
+   screen("AZI SECURITY","INTR "+String(dist)+"cm");
+ } else if(state=="FINAL"){
+   if(millis()-tLed>100){tLed=millis(); flash=!flash; digitalWrite(RED_LED,flash);}
+   if(!muted) tone(BUZZER,2500);
+   screen("AZI SECURITY","FINAL "+String(dist)+"cm");
+ } else {
+   digitalWrite(RED_LED,LOW);
+   noTone(BUZZER);
+   if(powerOn) screen("AZI SECURITY",armed?"ARMED":"READY");
+   else screen("AZI SECURITY","SYSTEM OFF");
+ }
+ delay(20);
+}

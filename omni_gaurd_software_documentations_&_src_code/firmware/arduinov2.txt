@@ -1,0 +1,436 @@
+//=====================================================
+// AZI HOUSE UNIT V3
+// PART 1 OF 2
+//=====================================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SoftwareSerial.h>
+
+//================ LCD ===================
+LiquidCrystal_I2C lcd(0x27,16,2);
+
+//================ BLUETOOTH =============
+SoftwareSerial BT(10,11);   // RX, TX
+
+//================ OUTPUTS ===============
+const byte RED_LED    = 6;
+const byte GREEN_LED  = 7;
+const byte BUZZER     = 8;
+
+//================ BUTTONS ===============
+const byte BTN_POWER   = 2;
+const byte BTN_ARM     = 3;
+const byte BTN_DISARM  = 4;
+const byte BTN_SILENCE = 5;
+
+//================ STATES =================
+enum ThreatState
+{
+    OFF_STATE,
+    READY_STATE,
+    WARNING_STATE,
+    INTRUDER_STATE,
+    FINAL_STATE
+};
+
+ThreatState currentState = OFF_STATE;
+
+bool powerOn=false;
+bool armed=false;
+bool muted=false;
+bool connected=false;
+
+//================ DATA ===================
+int distanceCM=0;
+
+String lastLCD1="";
+String lastLCD2="";
+
+unsigned long ledTimer=0;
+unsigned long buzzerTimer=0;
+unsigned long heartbeatTimer=0;
+unsigned long lcdTimer=0;
+
+bool redFlash=false;
+
+//================ BUTTON MEMORY ==========
+bool lastPowerState=HIGH;
+bool lastArmState=HIGH;
+bool lastDisarmState=HIGH;
+bool lastSilenceState=HIGH;
+
+//=====================================================
+// LCD UPDATE
+//=====================================================
+
+void updateLCD(String l1,String l2)
+{
+    if(lastLCD1==l1 && lastLCD2==l2)
+        return;
+
+    lastLCD1=l1;
+    lastLCD2=l2;
+
+    lcd.clear();
+
+    lcd.setCursor(0,0);
+    lcd.print(l1);
+
+    lcd.setCursor(0,1);
+    lcd.print(l2);
+}
+
+//=====================================================
+// SEND TO APP
+//=====================================================
+
+void sendMessage(String txt)
+{
+    BT.println(txt);
+    Serial.println(txt);
+}
+
+//=====================================================
+// BOOT SCREEN
+//=====================================================
+
+void bootScreen()
+{
+    updateLCD("OMNI GAURD","BOOTING...");
+    delay(1200);
+
+    updateLCD("OMNI GAURD","STARTING...");
+    delay(1200);
+
+    updateLCD("OMNI GAURD","WAITING APP");
+
+    sendMessage("OMNI_READY");
+}
+
+//=====================================================
+// SETUP
+//=====================================================
+
+void setup()
+{
+    pinMode(RED_LED,OUTPUT);
+    pinMode(GREEN_LED,OUTPUT);
+    pinMode(BUZZER,OUTPUT);
+
+    pinMode(BTN_POWER,INPUT_PULLUP);
+    pinMode(BTN_ARM,INPUT_PULLUP);
+    pinMode(BTN_DISARM,INPUT_PULLUP);
+    pinMode(BTN_SILENCE,INPUT_PULLUP);
+
+    Serial.begin(9600);
+    BT.begin(9600);
+
+    lcd.init();
+    lcd.backlight();
+
+    bootScreen();
+}
+
+//=====================================================
+// BUTTON HANDLER
+//=====================================================
+
+void checkButtons()
+{
+    bool p=digitalRead(BTN_POWER);
+    bool a=digitalRead(BTN_ARM);
+    bool d=digitalRead(BTN_DISARM);
+    bool s=digitalRead(BTN_SILENCE);
+
+    if(lastPowerState==HIGH && p==LOW)
+    {
+        powerOn=!powerOn;
+
+        if(powerOn)
+        {
+            currentState=READY_STATE;
+            sendMessage("BTN:POWER");
+        }
+        else
+        {
+            armed=false;
+            currentState=OFF_STATE;
+            noTone(BUZZER);
+            sendMessage("BTN:POWER");
+        }
+    }
+
+    if(powerOn)
+    {
+        if(lastArmState==HIGH && a==LOW)
+        {
+            armed=true;
+            muted=false;
+            sendMessage("BTN:ARM");
+        }
+
+        if(lastDisarmState==HIGH && d==LOW)
+        {
+            armed=false;
+            muted=false;
+            currentState=READY_STATE;
+            noTone(BUZZER);
+            sendMessage("BTN:DISARM");
+        }
+
+        if(lastSilenceState==HIGH && s==LOW)
+        {
+            muted=true;
+            noTone(BUZZER);
+            sendMessage("BTN:SILENCE");
+        }
+    }
+
+    lastPowerState=p;
+    lastArmState=a;
+    lastDisarmState=d;
+    lastSilenceState=s;
+}
+
+//=====================================================
+// BLUETOOTH PARSER
+//=====================================================
+
+void processCommand(String msg)
+{
+    msg.trim();
+
+    Serial.println(msg);
+
+    if(msg=="HELLO")
+    {
+        connected=true;
+        sendMessage("AZI_OK");
+        updateLCD("OMNI GAURD","CONNECTED");
+        delay(800);
+        return;
+    }
+
+    if(msg=="PING")
+    {
+        sendMessage("PONG");
+        return;
+    }
+
+    if(msg=="POWER:ON")
+    {
+        powerOn=true;
+        currentState=READY_STATE;
+        return;
+    }
+
+    if(msg=="POWER:OFF")
+    {
+        powerOn=false;
+        armed=false;
+        currentState=OFF_STATE;
+        noTone(BUZZER);
+        return;
+    }
+
+    if(msg=="ARM")
+    {
+        armed=true;
+        muted=false;
+        return;
+    }
+
+    if(msg=="DISARM")
+    {
+        armed=false;
+        muted=false;
+        currentState=READY_STATE;
+        noTone(BUZZER);
+        return;
+    }
+
+    if(msg=="SILENCE")
+    {
+        muted=true;
+        noTone(BUZZER);
+        return;
+    }
+
+    if(msg.startsWith("STATE:"))
+    {
+        String body=msg.substring(6);
+
+        int comma=body.indexOf(',');
+
+        String level=body;
+        distanceCM=0;
+
+        if(comma!=-1)
+        {
+            level=body.substring(0,comma);
+            distanceCM=body.substring(comma+1).toInt();
+        }
+
+        if(level=="READY")
+            currentState=READY_STATE;
+
+        else if(level=="WARNING")
+            currentState=WARNING_STATE;
+
+        else if(level=="INTRUDER")
+            currentState=INTRUDER_STATE;
+
+        else if(level=="FINAL")
+            currentState=FINAL_STATE;
+    }
+}
+
+//=====================================================
+// ALARM ENGINE
+//=====================================================
+
+void updateAlarm()
+{
+    unsigned long now = millis();
+
+    digitalWrite(GREEN_LED, powerOn && armed);
+
+    switch(currentState)
+    {
+        case OFF_STATE:
+
+            digitalWrite(RED_LED,LOW);
+            noTone(BUZZER);
+
+            updateLCD(
+                "OMNI GAURD",
+                "SYSTEM OFF"
+            );
+
+            break;
+
+        case READY_STATE:
+
+            digitalWrite(RED_LED,LOW);
+            noTone(BUZZER);
+
+            updateLCD(
+                "OMNI GAURD",
+                armed ? "ARMED" : "READY"
+            );
+
+            break;
+
+        case WARNING_STATE:
+
+            digitalWrite(RED_LED,HIGH);
+
+            if(!muted)
+            {
+                if(now-buzzerTimer>600)
+                {
+                    buzzerTimer=now;
+                    tone(BUZZER,1500,120);
+                }
+            }
+
+            updateLCD(
+                "WARNING",
+                String(distanceCM)+" cm"
+            );
+
+            break;
+
+        case INTRUDER_STATE:
+
+            if(now-ledTimer>250)
+            {
+                ledTimer=now;
+                redFlash=!redFlash;
+                digitalWrite(RED_LED,redFlash);
+            }
+
+            if(!muted)
+            {
+                if(now-buzzerTimer>300)
+                {
+                    buzzerTimer=now;
+                    tone(BUZZER,2000,120);
+                }
+            }
+
+            updateLCD(
+                "INTRUDER",
+                String(distanceCM)+" cm"
+            );
+
+            break;
+
+        case FINAL_STATE:
+
+            if(now-ledTimer>100)
+            {
+                ledTimer=now;
+                redFlash=!redFlash;
+                digitalWrite(RED_LED,redFlash);
+            }
+
+            if(!muted)
+            {
+                tone(BUZZER,2500);
+            }
+
+            updateLCD(
+                "FINAL ALERT",
+                String(distanceCM)+" cm"
+            );
+
+            break;
+    }
+}
+
+//=====================================================
+// HEARTBEAT
+//=====================================================
+
+void heartbeat()
+{
+    if(millis()-heartbeatTimer>5000)
+    {
+        heartbeatTimer=millis();
+
+        sendMessage("HEARTBEAT");
+    }
+}
+
+//=====================================================
+// RECEIVE BLUETOOTH
+//=====================================================
+
+void bluetoothLoop()
+{
+    if(BT.available())
+    {
+        String msg=BT.readStringUntil('\n');
+
+        processCommand(msg);
+    }
+}
+
+//=====================================================
+// LOOP
+//=====================================================
+
+void loop()
+{
+    bluetoothLoop();
+
+    checkButtons();
+
+    updateAlarm();
+
+    heartbeat();
+
+    delay(10);
+}
