@@ -301,7 +301,7 @@ Median filters are calibrated against standard indoor environments to filter out
 
 ![view](images/IMG-20260717-WA0035.jpg)
 
-![view](images/IMG-20260717-WA0072.jpg)
+![view](images/IMG-20260717-WA0077.jpg)
 
 ![view](images/Screenshot_20261106_095013_OMNI_GUARD.jpg)
 
