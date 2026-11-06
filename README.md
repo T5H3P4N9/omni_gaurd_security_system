@@ -109,7 +109,7 @@ OMNI_GUARD/
 │   │   └── house_unit_v7_1.ino
 │   └── sensor_unit/
 │       └── sensor_unit_v8_1.ino
-├── backend/
+├── Dashboard/
 │   └── flask_prototype/
 │       ├── app.py
 │       ├── requirements.txt
