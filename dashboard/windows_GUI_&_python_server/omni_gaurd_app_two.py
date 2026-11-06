@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 # ================= CONFIG =================
 # OpenAI API Key implementation preserved exactly as requested
-OPENAI_API_KEY = "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"
+OPENAI_API_KEY = "OPEN-AI API KEY HERE"
 
 # ================= GLOBAL STATE (OMNI_GUARD V2) =================
 # Combined existing states and new system requirements

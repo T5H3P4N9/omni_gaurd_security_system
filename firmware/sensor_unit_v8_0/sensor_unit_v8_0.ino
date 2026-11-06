@@ -14,9 +14,9 @@
 #include <nvs_flash.h>
 
 // ================= CONFIGURATION =================
-const char* ssid     = "NetNineNine_NPXg1_2.4Ghz";
-const char* password = "Y_t2x8yYwX";
-const char* serverIP = "192.168.1.71"; // Android App Ktor Server IP
+const char* ssid     = "WIFI ROUTER NAME";
+const char* password = "WIFI PASSWORD";
+const char* serverIP = "192.168.X.X"; // Android App Ktor Server IP
 #define APP_PORT     8000
 #define LOCAL_PORT   80     // ESP32 Web Server Port
 
