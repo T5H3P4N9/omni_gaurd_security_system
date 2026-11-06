@@ -297,6 +297,7 @@ Median filters are calibrated against standard indoor environments to filter out
 ![view](images/20260716_161938.jpg)
 
 ![view](images/IMG-20260717-WA0033.jpg)
+![view](images/IMG-20260717-WA0037.jpg)
 
 ![view](images/IMG-20260717-WA0035.jpg)
 
